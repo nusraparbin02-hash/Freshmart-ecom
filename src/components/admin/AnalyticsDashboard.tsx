@@ -12,9 +12,9 @@ import {
 } from 'recharts';
 
 export function AnalyticsDashboard() {
-  const { orders } = useStore();
+  const { orders, supabaseConnectionStatus } = useStore();
   const [activeCycle, setActiveCycle] = useState<'Daily' | 'Weekly' | 'Monthly' | 'Yearly'>('Daily');
-
+  
   // Filter completed orders to fold sales revenue into charts dynamically
   const completedOrders = useMemo(() => orders.filter(o => o.status === 'Completed'), [orders]);
   const completedRevenue = useMemo(() => completedOrders.reduce((sum, o) => sum + o.subtotal, 0), [completedOrders]);
@@ -118,7 +118,23 @@ export function AnalyticsDashboard() {
 
   return (
     <div className="space-y-6 font-sans">
-      {/* 3 Metric Cards Grid */}
+      {/* Header and Connection Status Banner */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 pb-3">
+        <div>
+          <h2 className="text-lg font-black text-gray-900">Analytics & Insights</h2>
+          <p className="text-xs text-gray-500">Real-time performance metrics and sales trajectories</p>
+        </div>
+        <div className="flex items-center space-x-2 bg-white border border-gray-200 px-3 py-1.5 rounded-xl shadow-sm">
+          <div className={`h-2.5 w-2.5 rounded-full ${supabaseConnectionStatus === 'connected' ? 'bg-[#16A34A] animate-pulse' : 'bg-amber-500 animate-pulse'}`} />
+          <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">
+            DB Status: {supabaseConnectionStatus === 'connected' ? (
+              <span className="text-[#16A34A]">Live Supabase</span>
+            ) : (
+              <span className="text-amber-600">Local Fallback</span>
+            )}
+          </span>
+        </div>
+      </div>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
         {/* KPI 1 */}
         <div className="bg-white border border-gray-200 rounded-2xl p-5 flex items-center justify-between shadow-sm">

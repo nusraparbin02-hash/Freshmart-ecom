@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 export interface Product {
   id: string;
@@ -39,8 +40,10 @@ interface StoreState {
   cart: CartItem[];
   orders: Order[];
   analyticsCycle: 'daily' | 'weekly' | 'monthly' | 'yearly';
-  addProduct: (product: Product) => void;
-  updateProduct: (id: string, updates: Partial<Product>) => void;
+  supabaseConnectionStatus: 'connected' | 'local-fallback';
+  fetchInitialData: () => Promise<void>;
+  addProduct: (product: Product) => Promise<void>;
+  updateProduct: (id: string, updates: Partial<Product>) => Promise<void>;
   addToCart: (productId: string) => { success: boolean; message: string };
   removeFromCart: (productId: string) => void;
   updateCartQuantity: (productId: string, quantity: number) => { success: boolean; message: string };
@@ -51,12 +54,12 @@ interface StoreState {
     customerAddress: string;
     pickupWindow: Order['pickupWindow'];
     paymentRoute: Order['paymentRoute'];
-  }) => Order;
-  updateOrderStatus: (orderId: string, status: Order['status']) => void;
+  }) => Promise<Order>;
+  updateOrderStatus: (orderId: string, status: Order['status']) => Promise<void>;
   setAnalyticsCycle: (cycle: 'daily' | 'weekly' | 'monthly' | 'yearly') => void;
   getAnalyticsData: () => AnalyticsPoint[];
-  addStockBulk: (parsedProducts: Product[]) => void;
-  updateProductInline: (id: string, field: keyof Product, value: any) => void;
+  addStockBulk: (parsedProducts: Product[]) => Promise<void>;
+  updateProductInline: (id: string, field: keyof Product, value: any) => Promise<void>;
 }
 
 const initialProducts: Product[] = [
@@ -121,38 +124,163 @@ export const useStore = create<StoreState>((set, get) => ({
   cart: [],
   orders: [],
   analyticsCycle: 'daily',
+  supabaseConnectionStatus: isSupabaseConfigured ? 'connected' : 'local-fallback',
 
-  addProduct: (product) => set((state) => {
-    const exists = state.products.some((p) => p.barcode === product.barcode);
-    if (exists) {
-      return {
-        products: state.products.map((p) =>
-          p.barcode === product.barcode ? { ...p, stock: p.stock + product.stock } : p
-        )
-      };
+  fetchInitialData: async () => {
+    if (!isSupabaseConfigured || !supabase) {
+      set({ supabaseConnectionStatus: 'local-fallback' });
+      return;
     }
-    return { products: [...state.products, product] };
-  }),
 
-  updateProduct: (id, updates) => set((state) => {
-    const updatedProducts = state.products.map((p) =>
-      p.id === id ? { ...p, ...updates } : p
-    );
-    
-    // Sync cart item product metadata & adjust quantities to stay within new stock limit
-    const updatedCart = state.cart.map((item) => {
-      if (item.product.id === id) {
-        const matchingProduct = updatedProducts.find((p) => p.id === id);
-        if (matchingProduct) {
-          const clampedQty = Math.min(item.quantity, matchingProduct.stock);
-          return { product: matchingProduct, quantity: clampedQty };
+    try {
+      // 1. Fetch Products
+      const { data: dbProducts, error: prodError } = await supabase
+        .from('products')
+        .select('*')
+        .order('name', { ascending: true });
+
+      if (prodError) throw prodError;
+
+      // 2. Fetch Orders with Items
+      const { data: dbOrders, error: orderError } = await supabase
+        .from('orders')
+        .select('*, order_items(*, products(*))')
+        .order('created_at', { ascending: false });
+
+      if (orderError) throw orderError;
+
+      // Map Supabase products to state
+      const mappedProducts: Product[] = (dbProducts || []).map((p: any) => ({
+        id: p.id,
+        barcode: p.barcode,
+        name: p.name,
+        category: p.category,
+        price: Number(p.price),
+        stock: Number(p.stock),
+        description: p.description || ''
+      }));
+
+      // Map Supabase orders to state
+      const mappedOrders: Order[] = (dbOrders || []).map((o: any) => ({
+        id: o.id,
+        customerName: o.customer_name,
+        customerPhone: o.customer_phone,
+        customerAddress: o.customer_address,
+        pickupWindow: o.pickup_window,
+        paymentRoute: o.payment_route,
+        subtotal: Number(o.subtotal),
+        status: o.status,
+        createdAt: o.created_at,
+        items: (o.order_items || []).map((oi: any) => ({
+          product: {
+            id: oi.products.id,
+            barcode: oi.products.barcode,
+            name: oi.products.name,
+            category: oi.products.category,
+            price: Number(oi.products.price),
+            stock: Number(oi.products.stock),
+            description: oi.products.description || ''
+          },
+          quantity: Number(oi.quantity)
+        }))
+      }));
+
+      set({
+        products: mappedProducts.length > 0 ? mappedProducts : initialProducts,
+        orders: mappedOrders,
+        supabaseConnectionStatus: 'connected'
+      });
+    } catch (err) {
+      console.error('Failed to load data from Supabase. Falling back to local state:', err);
+      set({ supabaseConnectionStatus: 'local-fallback' });
+    }
+  },
+
+  addProduct: async (product) => {
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data: existing } = await supabase
+          .from('products')
+          .select('stock')
+          .eq('barcode', product.barcode)
+          .maybeSingle();
+
+        if (existing) {
+          const newStock = Number(existing.stock) + product.stock;
+          await supabase
+            .from('products')
+            .update({ stock: newStock })
+            .eq('barcode', product.barcode);
+        } else {
+          await supabase
+            .from('products')
+            .insert({
+              id: product.id,
+              barcode: product.barcode,
+              name: product.name,
+              category: product.category,
+              price: product.price,
+              stock: product.stock,
+              description: product.description
+            });
         }
+      } catch (err) {
+        console.error('Supabase addProduct failed, updating local state only:', err);
       }
-      return item;
-    }).filter(item => item.quantity > 0);
+    }
 
-    return { products: updatedProducts, cart: updatedCart };
-  }),
+    set((state) => {
+      const exists = state.products.some((p) => p.barcode === product.barcode);
+      if (exists) {
+        return {
+          products: state.products.map((p) =>
+            p.barcode === product.barcode ? { ...p, stock: p.stock + product.stock } : p
+          )
+        };
+      }
+      return { products: [...state.products, product] };
+    });
+  },
+
+  updateProduct: async (id, updates) => {
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const dbUpdates: any = {};
+        if (updates.barcode !== undefined) dbUpdates.barcode = updates.barcode;
+        if (updates.name !== undefined) dbUpdates.name = updates.name;
+        if (updates.category !== undefined) dbUpdates.category = updates.category;
+        if (updates.price !== undefined) dbUpdates.price = updates.price;
+        if (updates.stock !== undefined) dbUpdates.stock = updates.stock;
+        if (updates.description !== undefined) dbUpdates.description = updates.description;
+
+        await supabase
+          .from('products')
+          .update(dbUpdates)
+          .eq('id', id);
+      } catch (err) {
+        console.error('Supabase updateProduct failed, updating local state only:', err);
+      }
+    }
+
+    set((state) => {
+      const updatedProducts = state.products.map((p) =>
+        p.id === id ? { ...p, ...updates } : p
+      );
+      
+      const updatedCart = state.cart.map((item) => {
+        if (item.product.id === id) {
+          const matchingProduct = updatedProducts.find((p) => p.id === id);
+          if (matchingProduct) {
+            const clampedQty = Math.min(item.quantity, matchingProduct.stock);
+            return { product: matchingProduct, quantity: clampedQty };
+          }
+        }
+        return item;
+      }).filter(item => item.quantity > 0);
+
+      return { products: updatedProducts, cart: updatedCart };
+    });
+  },
 
   addToCart: (productId) => {
     const { products, cart } = get();
@@ -208,11 +336,75 @@ export const useStore = create<StoreState>((set, get) => ({
 
   clearCart: () => set({ cart: [] }),
 
-  submitOrder: (orderData) => {
-    const { cart, products } = get();
+  submitOrder: async (orderData) => {
+    const { cart } = get();
     const subtotal = cart.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
-    
-    // Deduct stock levels permanently in state
+    const orderId = `ord-${Math.floor(1000 + Math.random() * 9000)}`;
+    const createdAtStr = new Date().toISOString();
+
+    if (isSupabaseConfigured && supabase) {
+      try {
+        // 1. Insert Order Row
+        const { error: orderErr } = await supabase.from('orders').insert({
+          id: orderId,
+          customer_name: orderData.customerName,
+          customer_phone: orderData.customerPhone,
+          customer_address: orderData.customerAddress,
+          pickup_window: orderData.pickupWindow,
+          payment_route: orderData.paymentRoute,
+          subtotal: subtotal,
+          status: 'Pending',
+          created_at: createdAtStr
+        });
+
+        if (orderErr) throw orderErr;
+
+        // 2. Insert Order Items Rows
+        const orderItems = cart.map((item) => ({
+          order_id: orderId,
+          product_id: item.product.id,
+          quantity: item.quantity,
+          price: item.product.price
+        }));
+
+        const { error: itemsErr } = await supabase.from('order_items').insert(orderItems);
+        if (itemsErr) throw itemsErr;
+
+        // 3. Deduct product stocks
+        for (const item of cart) {
+          const { data: dbProd } = await supabase
+            .from('products')
+            .select('stock')
+            .eq('id', item.product.id)
+            .maybeSingle();
+
+          const currentStock = dbProd ? Number(dbProd.stock) : item.product.stock;
+          const newStock = Math.max(0, currentStock - item.quantity);
+
+          await supabase
+            .from('products')
+            .update({ stock: newStock })
+            .eq('id', item.product.id);
+        }
+      } catch (err) {
+        console.error('Supabase submitOrder failed, processing locally only:', err);
+      }
+    }
+
+    // Process locally to keep frontend reactive
+    let newOrder: Order = {
+      id: orderId,
+      customerName: orderData.customerName,
+      customerPhone: orderData.customerPhone,
+      customerAddress: orderData.customerAddress,
+      pickupWindow: orderData.pickupWindow,
+      paymentRoute: orderData.paymentRoute,
+      items: [...cart],
+      subtotal,
+      status: 'Pending',
+      createdAt: createdAtStr
+    };
+
     set((state) => {
       const updatedProducts = state.products.map((p) => {
         const cartItem = cart.find((item) => item.product.id === p.id);
@@ -222,19 +414,6 @@ export const useStore = create<StoreState>((set, get) => ({
         return p;
       });
 
-      const newOrder: Order = {
-        id: `ord-${Math.floor(1000 + Math.random() * 9000)}`,
-        customerName: orderData.customerName,
-        customerPhone: orderData.customerPhone,
-        customerAddress: orderData.customerAddress,
-        pickupWindow: orderData.pickupWindow,
-        paymentRoute: orderData.paymentRoute,
-        items: [...cart],
-        subtotal,
-        status: 'Pending',
-        createdAt: new Date().toISOString()
-      };
-
       return {
         products: updatedProducts,
         orders: [newOrder, ...state.orders],
@@ -242,20 +421,31 @@ export const useStore = create<StoreState>((set, get) => ({
       };
     });
 
-    const currentOrders = get().orders;
-    return currentOrders[0];
+    return newOrder;
   },
 
-  updateOrderStatus: (orderId, status) => set((state) => ({
-    orders: state.orders.map((o) => o.id === orderId ? { ...o, status } : o)
-  })),
+  updateOrderStatus: async (orderId, status) => {
+    if (isSupabaseConfigured && supabase) {
+      try {
+        await supabase
+          .from('orders')
+          .update({ status })
+          .eq('id', orderId);
+      } catch (err) {
+        console.error('Supabase updateOrderStatus failed, updating locally only:', err);
+      }
+    }
+
+    set((state) => ({
+      orders: state.orders.map((o) => o.id === orderId ? { ...o, status } : o)
+    }));
+  },
 
   setAnalyticsCycle: (cycle) => set({ analyticsCycle: cycle }),
 
   getAnalyticsData: () => {
     const { orders, analyticsCycle } = get();
     
-    // Seed standard structural data
     const dailyBase = [
       { timeLabel: '09:00 AM', revenue: 120, ordersCount: 4 },
       { timeLabel: '12:00 PM', revenue: 240, ordersCount: 8 },
@@ -288,7 +478,6 @@ export const useStore = create<StoreState>((set, get) => ({
       { timeLabel: 'Q4', revenue: 18900, ordersCount: 630 }
     ];
 
-    // Fold completed order values from state directly into current cycle segments
     const completedOrders = orders.filter(o => o.status === 'Completed');
     const orderSum = completedOrders.reduce((sum, o) => sum + o.subtotal, 0);
 
@@ -299,7 +488,6 @@ export const useStore = create<StoreState>((set, get) => ({
       return yearlyBase;
     }
 
-    // Append current store activity to the final index element of charts
     const appendActiveData = (baseArray: typeof dailyBase) => {
       const updated = [...baseArray];
       const lastIndex = updated.length - 1;
@@ -317,48 +505,104 @@ export const useStore = create<StoreState>((set, get) => ({
     return appendActiveData(yearlyBase);
   },
 
-  addStockBulk: (parsedProducts) => set((state) => {
-    let updatedProducts = [...state.products];
-    parsedProducts.forEach((newP) => {
-      const existsIdx = updatedProducts.findIndex((p) => p.barcode === newP.barcode);
-      if (existsIdx > -1) {
-        updatedProducts[existsIdx] = {
-          ...updatedProducts[existsIdx],
-          stock: updatedProducts[existsIdx].stock + newP.stock,
-          name: newP.name || updatedProducts[existsIdx].name,
-          category: newP.category || updatedProducts[existsIdx].category,
-          price: newP.price || updatedProducts[existsIdx].price,
-          description: newP.description || updatedProducts[existsIdx].description,
-        };
-      } else {
-        updatedProducts.push(newP);
-      }
-    });
-    return { products: updatedProducts };
-  }),
+  addStockBulk: async (parsedProducts) => {
+    if (isSupabaseConfigured && supabase) {
+      try {
+        for (const newP of parsedProducts) {
+          const { data: existing } = await supabase
+            .from('products')
+            .select('stock, name, category, price, description')
+            .eq('barcode', newP.barcode)
+            .maybeSingle();
 
-  updateProductInline: (id, field, value) => set((state) => {
-    const updatedProducts = state.products.map((p) => {
-      if (p.id === id) {
+          if (existing) {
+            await supabase
+              .from('products')
+              .update({
+                stock: Number(existing.stock) + newP.stock,
+                name: newP.name || existing.name,
+                category: newP.category || existing.category,
+                price: newP.price || Number(existing.price),
+                description: newP.description || existing.description
+              })
+              .eq('barcode', newP.barcode);
+          } else {
+            await supabase.from('products').insert({
+              id: newP.id,
+              barcode: newP.barcode,
+              name: newP.name,
+              category: newP.category,
+              price: newP.price,
+              stock: newP.stock,
+              description: newP.description
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Supabase addStockBulk failed, updating locally only:', err);
+      }
+    }
+
+    set((state) => {
+      let updatedProducts = [...state.products];
+      parsedProducts.forEach((newP) => {
+        const existsIdx = updatedProducts.findIndex((p) => p.barcode === newP.barcode);
+        if (existsIdx > -1) {
+          updatedProducts[existsIdx] = {
+            ...updatedProducts[existsIdx],
+            stock: updatedProducts[existsIdx].stock + newP.stock,
+            name: newP.name || updatedProducts[existsIdx].name,
+            category: newP.category || updatedProducts[existsIdx].category,
+            price: newP.price || updatedProducts[existsIdx].price,
+            description: newP.description || updatedProducts[existsIdx].description,
+          };
+        } else {
+          updatedProducts.push(newP);
+        }
+      });
+      return { products: updatedProducts };
+    });
+  },
+
+  updateProductInline: async (id, field, value) => {
+    if (isSupabaseConfigured && supabase) {
+      try {
         let typedValue = value;
         if (field === 'price') typedValue = parseFloat(value) || 0;
         if (field === 'stock') typedValue = parseInt(value, 10) || 0;
-        return { ...p, [field]: typedValue };
-      }
-      return p;
-    });
 
-    const updatedCart = state.cart.map((item) => {
-      if (item.product.id === id) {
-        const matchingProduct = updatedProducts.find((p) => p.id === id);
-        if (matchingProduct) {
-          const clampedQty = Math.min(item.quantity, matchingProduct.stock);
-          return { product: matchingProduct, quantity: clampedQty };
+        await supabase
+          .from('products')
+          .update({ [field]: typedValue })
+          .eq('id', id);
+      } catch (err) {
+        console.error('Supabase updateProductInline failed, updating locally only:', err);
+      }
+    }
+
+    set((state) => {
+      const updatedProducts = state.products.map((p) => {
+        if (p.id === id) {
+          let typedValue = value;
+          if (field === 'price') typedValue = parseFloat(value) || 0;
+          if (field === 'stock') typedValue = parseInt(value, 10) || 0;
+          return { ...p, [field]: typedValue };
         }
-      }
-      return item;
-    }).filter(item => item.quantity > 0);
+        return p;
+      });
 
-    return { products: updatedProducts, cart: updatedCart };
-  })
+      const updatedCart = state.cart.map((item) => {
+        if (item.product.id === id) {
+          const matchingProduct = updatedProducts.find((p) => p.id === id);
+          if (matchingProduct) {
+            const clampedQty = Math.min(item.quantity, matchingProduct.stock);
+            return { product: matchingProduct, quantity: clampedQty };
+          }
+        }
+        return item;
+      }).filter(item => item.quantity > 0);
+
+      return { products: updatedProducts, cart: updatedCart };
+    });
+  }
 }));
